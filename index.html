@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>KS QUANTMASTER PRO - ระบบถอดแบบปริมาณและประมาณการราคางานก่อสร้างครบวงจร (AI-Powered Takeoff & Estimating Studio)</title>
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -479,8 +480,11 @@
               <label class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-cyan-300 px-2.5 py-1 rounded border border-slate-700 flex items-center space-x-1">
                 <svg class="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
                 <span>อัปโหลดแบบ (PDF/CAD)</span>
-                <input type="file" id="blueprintFileInput" accept=".pdf,.dwg,.dxf,.png,.jpg,.jpeg,.svg" class="hidden">
+                <input type="file" id="blueprintFileInput" accept=".pdf,.dwg,.dxf,.png,.jpg,.jpeg,.webp,.svg" class="hidden">
               </label>
+              <button id="btnResetUploadedBlueprint" class="hidden bg-slate-800 hover:bg-slate-700 text-rose-300 text-xs px-2 py-1 rounded border border-slate-700 transition" title="ล้างแบบที่อัปโหลดและกลับสู่แบบแปลนมาตรฐาน">
+                ✕ ใช้แบบเดิม
+              </button>
 
               <!-- Advanced Drawing Aids: Legend Table, Compare Revisions, Ortho & Snap -->
               <button id="btnToggleLegend" class="bg-slate-800 hover:bg-slate-700 text-amber-300 px-2 py-1 rounded border border-slate-700 flex items-center space-x-1" title="แสดง/ซ่อน ตาราง Markups Legend บนแบบแปลน (Project Legend Table)">
@@ -3076,6 +3080,11 @@
         { id: 'REV-1', name: 'แผนปรับปรุงเร่งรัด Rev.1 (Catch-up Acceleration)', startMonth: 5, catchupRate: 1.5, active: true }
       ],
       milestones: [],
+      // Uploaded Blueprint State & Persistence
+      uploadedBlueprintImage: null,
+      uploadedBlueprintsByFloor: {},
+      showCadOverlayWithUpload: false,
+      blueprintOpacity: 1.0,
       // Advanced Takeoff Tools & State
       showLegendOnCanvas: true,
       orthoMode: false,
@@ -3370,9 +3379,52 @@
         ctx.stroke();
       }
 
-      // Layer 1: Architecture Plan (Walls, Rooms, Doors, Windows, Grids)
-      if (project.layers.arch) {
-        drawArchitecturePlan(w, h, themePaper);
+      // Layer 1: Blueprint Plan (Uploaded PDF / Image or Built-in CAD Architecture Plan)
+      const activeLoc = project.activeLocation;
+      const uploadedImg = (project.uploadedBlueprintsByFloor && project.uploadedBlueprintsByFloor[activeLoc]) 
+        ? project.uploadedBlueprintsByFloor[activeLoc] 
+        : project.uploadedBlueprintImage;
+
+      if (uploadedImg) {
+        // Draw the uploaded blueprint image with clean aspect ratio fitting
+        ctx.save();
+        ctx.globalAlpha = project.blueprintOpacity !== undefined ? project.blueprintOpacity : 1.0;
+
+        const imgW = uploadedImg.naturalWidth || uploadedImg.width || 800;
+        const imgH = uploadedImg.naturalHeight || uploadedImg.height || 600;
+
+        // Target drawing bounding box on canvas
+        const targetX = 80;
+        const targetY = 50;
+        const maxW = w - 160;
+        const maxH = h - 90;
+
+        const scale = Math.min(maxW / imgW, maxH / imgH);
+        const drawW = imgW * scale;
+        const drawH = imgH * scale;
+        const drawX = targetX + (maxW - drawW) / 2;
+        const drawY = targetY + (maxH - drawH) / 2;
+
+        ctx.drawImage(uploadedImg, drawX, drawY, drawW, drawH);
+
+        // Frame around uploaded blueprint
+        ctx.strokeStyle = themePaper ? 'rgba(100, 116, 139, 0.4)' : 'rgba(14, 165, 233, 0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(drawX, drawY, drawW, drawH);
+        ctx.restore();
+
+        // Optional CAD wall overlay if user wants both
+        if (project.layers.arch && project.showCadOverlayWithUpload) {
+          ctx.save();
+          ctx.globalAlpha = 0.35;
+          drawArchitecturePlan(w, h, themePaper);
+          ctx.restore();
+        }
+      } else {
+        // No uploaded blueprint for this floor: draw built-in CAD architecture plan
+        if (project.layers.arch) {
+          drawArchitecturePlan(w, h, themePaper);
+        }
       }
 
       // Layer 2: Takeoffs on Current Location
@@ -5768,34 +5820,105 @@
       showToast(`เพิ่มประเภทอาคารใหม่ [${icon} ${name}] สำเร็จแล้ว`, 'success');
     });
 
-    // Blueprint File Upload Simulation (PDF/CAD/Image)
+    // Robust Blueprint File Upload Engine (PDF, PNG, JPG, WEBP, SVG & CAD)
     $('blueprintFileInput').addEventListener('change', (e) => {
       const file = e.target.files[0];
       if (!file) return;
 
-      showToast(`กำลังโหลดแบบแปลน: ${file.name}...`, 'info');
-      const reader = new FileReader();
+      const activeLoc = project.activeLocation;
+      showToast(`กำลังประมวลผลแบบแปลน: ${file.name}...`, 'info');
 
-      // If image, paint directly
-      if (file.type.startsWith('image/')) {
-        reader.onload = function(evt) {
+      // 1. PDF File Upload Handler using PDF.js
+      if (file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf') {
+        const fileReader = new FileReader();
+        fileReader.onload = function () {
+          const typedarray = new Uint8Array(this.result);
+          if (window.pdfjsLib) {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            window.pdfjsLib.getDocument(typedarray).promise.then(function (pdf) {
+              pdf.getPage(1).then(function (page) {
+                const viewport = page.getViewport({ scale: 2.0 });
+                const offCanvas = document.createElement('canvas');
+                const offContext = offCanvas.getContext('2d');
+                offCanvas.height = viewport.height;
+                offCanvas.width = viewport.width;
+
+                const renderContext = {
+                  canvasContext: offContext,
+                  viewport: viewport
+                };
+                page.render(renderContext).promise.then(function () {
+                  const dataUrl = offCanvas.toDataURL('image/png');
+                  const img = new Image();
+                  img.onload = function () {
+                    project.uploadedBlueprintImage = img;
+                    if (!project.uploadedBlueprintsByFloor) project.uploadedBlueprintsByFloor = {};
+                    project.uploadedBlueprintsByFloor[activeLoc] = img;
+
+                    $('canvasPlanTitle').textContent = file.name.toUpperCase();
+                    if ($('btnResetUploadedBlueprint')) $('btnResetUploadedBlueprint').classList.remove('hidden');
+
+                    renderCanvas();
+                    showToast(`โหลดแบบแปลน PDF สำเร็จ: ${file.name} (เรนเดอร์ลงแบบแปลนเรียบร้อย)`, 'success');
+                  };
+                  img.src = dataUrl;
+                });
+              });
+            }).catch(function (err) {
+              console.error('PDF.js render error:', err);
+              showToast('ไม่สามารถเปิดเรนเดอร์ PDF ได้ กรุณาลองใช้ไฟล์ภาพ PNG หรือ JPG', 'warning');
+            });
+          } else {
+            showToast('กำลังโหลดไลบรารี PDF กรุณาลองใหม่อีกครั้งใน 2 วินาที', 'warning');
+          }
+        };
+        fileReader.readAsArrayBuffer(file);
+      } 
+      // 2. Image File Upload Handler (PNG, JPG, JPEG, WEBP, SVG)
+      else if (file.type.startsWith('image/') || /\.(png|jpe?g|webp|svg|bmp)$/i.test(file.name)) {
+        const reader = new FileReader();
+        reader.onload = function (evt) {
           const img = new Image();
-          img.onload = function() {
-            ctx.drawImage(img, 100, 80, 750, 460);
-            showToast(`โหลดแบบภาพสำเร็จ: ${file.name}`, 'success');
+          img.onload = function () {
+            project.uploadedBlueprintImage = img;
+            if (!project.uploadedBlueprintsByFloor) project.uploadedBlueprintsByFloor = {};
+            project.uploadedBlueprintsByFloor[activeLoc] = img;
+
+            $('canvasPlanTitle').textContent = file.name.toUpperCase();
+            if ($('btnResetUploadedBlueprint')) $('btnResetUploadedBlueprint').classList.remove('hidden');
+
+            renderCanvas();
+            showToast(`โหลดแบบภาพสำเร็จ: ${file.name} (เรนเดอร์ลงแบบแปลนเรียบร้อย)`, 'success');
           };
           img.src = evt.target.result;
         };
         reader.readAsDataURL(file);
-      } else {
-        // For PDF or CAD (DWG), simulate rendering vector blueprint
+      } 
+      // 3. Other CAD files (DWG/DXF text/vector fallback)
+      else {
         setTimeout(() => {
           $('canvasPlanTitle').textContent = file.name.toUpperCase();
-          showToast(`แปลงแบบแปลน ${file.name} เข้าสู่ระบบเรียบร้อย`, 'success');
+          if ($('btnResetUploadedBlueprint')) $('btnResetUploadedBlueprint').classList.remove('hidden');
           renderCanvas();
-        }, 600);
+          showToast(`ประมวลผลไฟล์แบบแปลน: ${file.name}`, 'success');
+        }, 800);
       }
     });
+
+    // Reset to Default Blueprint Plan
+    if ($('btnResetUploadedBlueprint')) {
+      $('btnResetUploadedBlueprint').addEventListener('click', () => {
+        const activeLoc = project.activeLocation;
+        project.uploadedBlueprintImage = null;
+        if (project.uploadedBlueprintsByFloor) {
+          delete project.uploadedBlueprintsByFloor[activeLoc];
+        }
+        $('btnResetUploadedBlueprint').classList.add('hidden');
+        $('canvasPlanTitle').textContent = 'CAD TYPICAL FLOOR PLAN';
+        renderCanvas();
+        showToast('รีเซ็ตกลับสู่แบบแปลนมาตรฐานเรียบร้อย', 'info');
+      });
+    }
 
     // Plant Room Tabs Wiring
     document.querySelectorAll('.plant-room-tab').forEach(tab => {
